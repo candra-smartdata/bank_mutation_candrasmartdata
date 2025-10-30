@@ -1,0 +1,168 @@
+import io
+import re
+import tempfile
+from pathlib import Path
+import pandas as pd
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
+import openpyxl
+import streamlit as st
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# Konfigurasi halaman
+st.set_page_config(page_title="Candra Smart Data App", layout="wide")
+
+st.title("📄 PDF → Excel Mutasi Bank (Smart Data)")
+st.markdown("Unggah PDF hasil scan, lakukan OCR, ekstrak transaksi, dan lihat analisis Smart Data (grafik & insight).")
+
+uploaded_pdf = st.file_uploader("Unggah file PDF hasil scan (mutasi bank)", type=["pdf"])
+uploaded_template = st.file_uploader("Template Excel (opsional)", type=["xlsx"])
+lang = st.text_input("Bahasa OCR (default: 'ind' untuk Bahasa Indonesia)", value="ind")
+dpi = st.slider("Resolusi konversi PDF→Gambar (dpi)", 100, 400, 200)
+run_button = st.button("🚀 Proses PDF & Analisis")
+
+# Pola dan fungsi bantu
+DATE_PAT = r'(\d{1,2}[\/\-\.\s]\d{1,2}[\/\-\.\s]\d{2,4})'
+AMOUNT_PAT = r'([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)'
+LINE_TX_PAT = re.compile(rf'{DATE_PAT}(.+?)\s+{AMOUNT_PAT}(?:\s+{AMOUNT_PAT})?.*', flags=re.IGNORECASE)
+
+def normalize_amount(s):
+    if not s:
+        return None
+    s = s.strip().replace('.', '').replace(',', '.')
+    try:
+        return float(s)
+    except:
+        return None
+
+def extract_transactions(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    txs = []
+    for ln in lines:
+        m = LINE_TX_PAT.search(ln)
+        if m:
+            date = m.group(1).strip()
+            desc = m.group(2).strip() if len(m.groups()) >= 2 else ""
+            amts = re.findall(AMOUNT_PAT, ln)
+            debit = kredit = None
+            if len(amts) == 1:
+                debit = normalize_amount(amts[0])
+            elif len(amts) >= 2:
+                debit = normalize_amount(amts[0])
+                kredit = normalize_amount(amts[1])
+            txs.append({
+                "Tanggal": date,
+                "Keterangan": desc,
+                "Debit": debit,
+                "Kredit": kredit,
+                "Saldo": None,
+                "Referensi": ""
+            })
+    return txs
+
+def parse_dates(df):
+    def tryparse(s):
+        for fmt in ("%d/%m/%Y","%d-%m-%Y","%d.%m.%Y","%d %m %Y","%d/%m/%y"):
+            try:
+                return datetime.strptime(s, fmt)
+            except:
+                continue
+        return pd.to_datetime(s, dayfirst=True, errors="coerce")
+    df["Tanggal_parsed"] = df["Tanggal"].astype(str).apply(tryparse)
+    return df
+
+def monthly_summary(df):
+    if "Tanggal_parsed" not in df.columns:
+        return pd.DataFrame()
+    df2 = df.dropna(subset=["Tanggal_parsed"]).copy()
+    df2["YearMonth"] = df2["Tanggal_parsed"].dt.to_period("M").astype(str)
+    return df2.groupby("YearMonth").agg({"Debit":"sum","Kredit":"sum"}).reset_index()
+
+def detect_anomalies(df):
+    res = []
+    for col in ["Debit","Kredit"]:
+        s = df[col].dropna().astype(float)
+        if s.empty: continue
+        mean, std = s.mean(), s.std()
+        threshold = mean + 3*std if std else mean*2
+        anoms = df[df[col].notnull() & (df[col].astype(float) > threshold)]
+        for _, row in anoms.iterrows():
+            res.append({
+                "Tanggal": row.get("Tanggal"),
+                "Keterangan": row.get("Keterangan"),
+                "Tipe": col,
+                "Nilai": row.get(col)
+            })
+    return pd.DataFrame(res)
+
+# Jalankan OCR + Analisis
+if run_button:
+    if not uploaded_pdf:
+        st.error("⚠️ Harap unggah file PDF terlebih dahulu.")
+    else:
+        st.info("⏳ Sedang menjalankan OCR, harap tunggu...")
+        pdf_bytes = uploaded_pdf.read()
+        images = convert_from_bytes(pdf_bytes, dpi=dpi)
+        all_text = ""
+        for i, img in enumerate(images, start=1):
+            st.write(f"🔍 Memproses halaman {i} ...")
+            text = pytesseract.image_to_string(img, lang=lang if lang else None)
+            all_text += f"\n--- Halaman {i} ---\n{text}"
+
+        txs = extract_transactions(all_text)
+        df = pd.DataFrame(txs)
+
+        if df.empty:
+            st.warning("❗ Tidak ditemukan transaksi. Periksa hasil OCR di bawah ini:")
+            st.text_area("Hasil OCR Mentah", all_text, height=300)
+        else:
+            df = parse_dates(df)
+            for c in ["Debit","Kredit","Saldo"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            st.subheader("📋 Hasil Ekstraksi Transaksi")
+            st.dataframe(df[["Tanggal","Keterangan","Debit","Kredit","Saldo"]])
+
+            # Smart Data
+            st.subheader("📊 Analisis Smart Data (Ringkasan Bulanan)")
+            monthly = monthly_summary(df)
+            if not monthly.empty:
+                st.dataframe(monthly)
+                fig, ax = plt.subplots(figsize=(8,4))
+                ax.plot(monthly["YearMonth"], monthly["Debit"], marker='o', label="Debit")
+                ax.plot(monthly["YearMonth"], monthly["Kredit"], marker='o', label="Kredit")
+                ax.legend()
+                ax.set_title("Debit & Kredit per Bulan")
+                ax.set_xlabel("Bulan")
+                ax.set_ylabel("Jumlah")
+                plt.xticks(rotation=45)
+                st.pyplot(fig)
+
+            st.subheader("📈 Insight & Deteksi Anomali")
+            total_debit = df["Debit"].sum(min_count=1)
+            total_kredit = df["Kredit"].sum(min_count=1)
+            avg_tx = df[["Debit","Kredit"]].stack().mean()
+            st.markdown(f"- **Total Debit:** {total_debit:,.2f}")
+            st.markdown(f"- **Total Kredit:** {total_kredit:,.2f}")
+            st.markdown(f"- **Rata-rata Nilai Transaksi:** {avg_tx:,.2f}")
+
+            anoms = detect_anomalies(df)
+            if anoms.empty:
+                st.markdown("- ✅ Tidak ditemukan transaksi anomali (threshold > mean+3×std).")
+            else:
+                st.markdown("⚠️ **Transaksi anomali terdeteksi:**")
+                st.table(anoms)
+
+            # Simpan ke Excel
+            out_bytes = io.BytesIO()
+            with pd.ExcelWriter(out_bytes, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Summary")
+
+            st.download_button(
+                "⬇️ Unduh Excel Hasil",
+                data=out_bytes.getvalue(),
+                file_name="mutasi_smartdata.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
